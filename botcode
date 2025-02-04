@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+
+
+import os
+import logging
+import asyncio
+import tempfile
+from datetime import datetime, timezone
+
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+import motor.motor_asyncio
+import google.generativeai as genai
+from googlesearch import search
+from dotenv import load_dotenv
+
+
+async def safe_reply_text(update: Update, text: str):
+    """
+    Sends the provided text in chunks not exceeding 4096 characters (Telegram's limit).
+    This helper prevents "Message is too long" errors.
+    """
+    max_length = 4096
+    try:
+        if len(text) <= max_length:
+            await update.message.reply_text(text)
+        else:
+            for i in range(0, len(text), max_length):
+                await update.message.reply_text(text[i:i+max_length])
+    except Exception as e:
+        logging.error(f"Error sending message: {e}")
+
+#  Gemini File Upload Helper 
+def upload_to_gemini(path, mime_type=None):
+    """
+    Uploads the given file to Gemini.
+    See https://ai.google.dev/gemini-api/docs/prompting_with_media
+    """
+    file = genai.upload_file(path, mime_type=mime_type)
+    logging.info(f"Uploaded file '{file.display_name}' as: {file.uri}")
+    return file
+
+#  Configuration & Initialization 
+
+load_dotenv()  
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Retrieve required environment variables.
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not TELEGRAM_TOKEN or not MONGO_URI or not GEMINI_API_KEY:
+    logger.error("Missing required environment variables. Please set TELEGRAM_TOKEN, MONGO_URI, and GEMINI_API_KEY.")
+    exit(1)
+
+# Initialize MongoDB client (using Motor for asynchronous operations)
+mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+db = mongo_client["telegram_bot_db"]
+users_collection = db["users"]
+chat_history_collection = db["chat_history"]
+file_metadata_collection = db["file_metadata"]
+
+# Configure Gemini API and create the model (using Gemini 2.0 flash experimental).
+genai.configure(api_key=GEMINI_API_KEY)
+generation_config = {
+    "temperature": 1,
+    "top_p": 0.95,
+    "top_k": 40,
+    "max_output_tokens": 8192,
+    "response_mime_type": "text/plain",
+}
+model = genai.GenerativeModel(model_name="gemini-2.0-flash-exp", generation_config=generation_config)
+
+#  Helper Functions 
+
+async def call_gemini_chat(prompt: str) -> str:
+    """
+    Calls Gemini to generate a chat response using the provided prompt.
+    This function is executed asynchronously to minimize latency.
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(None, lambda: model.generate_content(prompt))
+        if result and hasattr(result, "text"):
+            return result.text
+    except Exception as e:
+        logger.error(f"Gemini chat API error: {e}")
+    return "I'm not sure how to respond to that."
+
+async def call_gemini_image_analysis(file_path: str, mime_type: str) -> str:
+    """
+    Uploads the local file to Gemini and starts a chat session with the uploaded media.
+    The prompt instructs Gemini to "Describe the contents in the image." A non-empty message is sent
+    to trigger the response.
+    This call is wrapped in an executor to ensure fast asynchronous processing.
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        uploaded_file = await loop.run_in_executor(None, lambda: upload_to_gemini(file_path, mime_type))
+        chat_session = model.start_chat(
+            history=[
+                {
+                    "role": "user",
+                    "parts": [
+                        uploaded_file,
+                        "Describe the contents in the image.\n",
+                    ],
+                }
+            ]
+        )
+        # Send a non-empty message to trigger the response.
+        response = await loop.run_in_executor(None, lambda: chat_session.send_message("Analyze the image"))
+        if response and hasattr(response, "text"):
+            return response.text
+    except Exception as e:
+        logger.error(f"Gemini image analysis API error: {e}")
+    return "Unable to analyze the image content."
+
+async def perform_web_search(query: str) -> str:
+    """
+    Retrieves top search results for the query using the googlesearch module and asks Gemini
+    to summarize them. This operation is executed asynchronously.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        search_results = await loop.run_in_executor(None, lambda: list(search(query, num_results=5)))
+        if not search_results:
+            return "No results found."
+        prompt = "Summarize the following search results and provide a concise summary:\n" + "\n".join(search_results)
+        result = await loop.run_in_executor(None, lambda: model.generate_content(prompt))
+        summary = result.text if result and hasattr(result, "text") else "Could not generate a summary of the search results."
+        summary += "\n\nTop Links:\n" + "\n".join(search_results)
+        return summary
+    except Exception as e:
+        logger.error(f"Web search error: {e}")
+        return "Error performing web search."
+
+#  Telegram Bot Handlers 
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /start command handler: Registers the user and prompts for a contact number.
+    Uses asynchronous MongoDB operations for fast response times.
+    """
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    try:
+        existing = await users_collection.find_one({"chat_id": chat_id})
+        if existing:
+            await safe_reply_text(update, "You are already registered!")
+        else:
+            new_user = {
+                "chat_id": chat_id,
+                "first_name": user.first_name,
+                "username": user.username,
+                "registered_at": datetime.now(timezone.utc)
+            }
+            await users_collection.insert_one(new_user)
+            # Prompt for phone number using a contact button.
+            contact_button = KeyboardButton(text="Share Contact", request_contact=True)
+            reply_markup = ReplyKeyboardMarkup([[contact_button]], one_time_keyboard=True, resize_keyboard=True)
+            await safe_reply_text(update, "Welcome! Please share your contact to complete registration.")
+            await update.message.reply_text(reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Error in /start handler: {e}")
+        await safe_reply_text(update, "An error occurred during registration.")
+
+async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Processes incoming contact messages to update the user's phone number.
+    Asynchronous DB updates ensure minimal latency.
+    """
+    contact = update.message.contact
+    chat_id = update.effective_chat.id
+    if contact:
+        try:
+            await users_collection.update_one({"chat_id": chat_id}, {"$set": {"phone_number": contact.phone_number}})
+            await safe_reply_text(update, "Thank you! Your phone number has been registered.")
+        except Exception as e:
+            logger.error(f"Error updating contact: {e}")
+            await safe_reply_text(update, "Failed to register your contact.")
+    else:
+        await safe_reply_text(update, "No contact information received.")
+
+async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Processes plain text messages by forwarding them to Gemini and storing the conversation.
+    This asynchronous handler ensures fast processing of user queries.
+    """
+    text = update.message.text
+    chat_id = update.effective_chat.id
+    try:
+        response = await call_gemini_chat(text)
+    except Exception as e:
+        logger.error(f"Error in chat handler: {e}")
+        response = "Sorry, I'm having trouble processing your request."
+    await safe_reply_text(update, response)
+    record = {
+        "chat_id": chat_id,
+        "user_message": text,
+        "bot_response": response,
+        "timestamp": datetime.now(timezone.utc)
+    }
+    try:
+        await chat_history_collection.insert_one(record)
+    except Exception as e:
+        logger.error(f"Error saving chat history: {e}")
+
+async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles image/file uploads by:
+      1. Downloading the file locally.
+      2. Determining its MIME type.
+      3. Uploading it to Gemini and starting a chat session with the media attached.
+      4. Replying with Gemini’s analysis.
+      5. Storing file metadata in MongoDB.
+    Asynchronous file handling and DB storage ensure fast responses.
+    """
+    chat_id = update.effective_chat.id
+    file_info = None
+    file_name = None
+    mime_type = None
+
+    if update.message.photo:
+        photo = update.message.photo[-1]  # Use the highest resolution available
+        file_info = await photo.get_file()
+        file_name = f"{photo.file_id}.jpg"
+        mime_type = "image/jpeg"
+    elif update.message.document:
+        document = update.message.document
+        file_info = await document.get_file()
+        file_name = document.file_name
+        if file_name.lower().endswith((".jpg", ".jpeg")):
+            mime_type = "image/jpeg"
+        elif file_name.lower().endswith(".png"):
+            mime_type = "image/png"
+        elif file_name.lower().endswith(".pdf"):
+            mime_type = "application/pdf"
+        else:
+            await safe_reply_text(update, "Unsupported file type.")
+            return
+    else:
+        return
+
+    temp_dir = tempfile.gettempdir()
+    file_path = os.path.join(temp_dir, file_name)
+
+    try:
+        await file_info.download_to_drive(file_path)
+        analysis = await call_gemini_image_analysis(file_path, mime_type)
+        await safe_reply_text(update, f"Analysis: {analysis}")
+        metadata = {
+            "chat_id": chat_id,
+            "file_name": file_name,
+            "description": analysis,
+            "timestamp": datetime.now(timezone.utc)
+        }
+        await file_metadata_collection.insert_one(metadata)
+    except Exception as e:
+        logger.error(f"Error processing file: {e}")
+        await safe_reply_text(update, "Failed to analyze the file.")
+
+async def websearch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles the /websearch command by prompting the user for a search query.
+    Asynchronous search operations ensure minimal delay.
+    """
+    context.user_data["awaiting_websearch_query"] = True
+    await safe_reply_text(update, "Please enter your search query:")
+
+async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Routes text messages either to the web search process (if awaiting a query)
+    or to the Gemini chat handler.
+    """
+    if context.user_data.get("awaiting_websearch_query"):
+        query = update.message.text
+        context.user_data["awaiting_websearch_query"] = False
+        result = await perform_web_search(query)
+        await safe_reply_text(update, result)
+    else:
+        await chat_handler(update, context)
+
+async def sentiment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Analyzes the sentiment of provided text using Gemini.
+    Usage: /sentiment I love this chatbot!
+    """
+    if context.args:
+        text_to_analyze = " ".join(context.args)
+    else:
+        await safe_reply_text(update, "Please provide text to analyze sentiment, e.g., /sentiment I love this!")
+        return
+
+    prompt = f"Analyze the sentiment of the following text and provide a brief explanation: {text_to_analyze}"
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(None, lambda: model.generate_content(prompt))
+        sentiment = result.text if result and hasattr(result, "text") else "Could not analyze sentiment."
+    except Exception as e:
+        logger.error(f"Sentiment analysis error: {e}")
+        sentiment = "Error analyzing sentiment."
+    await safe_reply_text(update, sentiment)
+
+async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Auto-translates text into a specified target language using Gemini.
+    Usage: /translate <target_language> <text to translate>
+    """
+    if len(context.args) < 2:
+        await safe_reply_text(update, "Usage: /translate <target_language> <text>")
+        return
+
+    target_language = context.args[0]
+    text_to_translate = " ".join(context.args[1:])
+    prompt = f"Translate the following text into {target_language}:\n\n{text_to_translate}"
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(None, lambda: model.generate_content(prompt))
+        translation = result.text if result and hasattr(result, "text") else "Could not translate the text."
+    except Exception as e:
+        logger.error(f"Translation error: {e}")
+        translation = "Error performing translation."
+    await safe_reply_text(update, translation)
+
+#  Main Function 
+
+def main():
+    """
+    Sets up handlers and starts the Telegram bot.
+    Asynchronous polling ensures fast message processing and minimal API latency.
+    """
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # Command Handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("websearch", websearch_command))
+    application.add_handler(CommandHandler("sentiment", sentiment_command))
+    application.add_handler(CommandHandler("translate", translate_command))
+    
+    # Message Handlers
+    application.add_handler(MessageHandler(filters.CONTACT, contact_handler))
+    application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, file_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
+
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
